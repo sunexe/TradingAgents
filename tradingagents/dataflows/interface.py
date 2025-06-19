@@ -630,6 +630,9 @@ def get_YFin_data_online(
     start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
     end_date: Annotated[str, "Start date in yyyy-mm-dd format"],
 ):
+    import time
+    import random
+    from requests.exceptions import RequestException
 
     datetime.strptime(start_date, "%Y-%m-%d")
     datetime.strptime(end_date, "%Y-%m-%d")
@@ -637,34 +640,71 @@ def get_YFin_data_online(
     # Create ticker object
     ticker = yf.Ticker(symbol.upper())
 
-    # Fetch historical data for the specified date range
-    data = ticker.history(start=start_date, end=end_date)
+    # Retry mechanism for rate limiting
+    max_retries = 3
+    base_delay = 5  # Base delay in seconds
+    
+    for attempt in range(max_retries):
+        try:
+            # Add random delay to avoid synchronized requests
+            if attempt > 0:
+                delay = base_delay * (2 ** attempt) + random.uniform(1, 3)
+                print(f"Retrying in {delay:.1f} seconds... (attempt {attempt + 1}/{max_retries})")
+                time.sleep(delay)
+            
+            # Fetch historical data for the specified date range
+            data = ticker.history(start=start_date, end=end_date)
 
-    # Check if data is empty
-    if data.empty:
-        return (
-            f"No data found for symbol '{symbol}' between {start_date} and {end_date}"
-        )
+            # Check if data is empty
+            if data.empty:
+                return (
+                    f"No data found for symbol '{symbol}' between {start_date} and {end_date}"
+                )
 
-    # Remove timezone info from index for cleaner output
-    if data.index.tz is not None:
-        data.index = data.index.tz_localize(None)
+            # Remove timezone info from index for cleaner output
+            if data.index.tz is not None:
+                data.index = data.index.tz_localize(None)
 
-    # Round numerical values to 2 decimal places for cleaner display
-    numeric_columns = ["Open", "High", "Low", "Close", "Adj Close"]
-    for col in numeric_columns:
-        if col in data.columns:
-            data[col] = data[col].round(2)
+            # Round numerical values to 2 decimal places for cleaner display
+            numeric_columns = ["Open", "High", "Low", "Close", "Adj Close"]
+            for col in numeric_columns:
+                if col in data.columns:
+                    data[col] = data[col].round(2)
 
-    # Convert DataFrame to CSV string
-    csv_string = data.to_csv()
+            # Convert DataFrame to CSV string
+            csv_string = data.to_csv()
 
-    # Add header information
-    header = f"# Stock data for {symbol.upper()} from {start_date} to {end_date}\n"
-    header += f"# Total records: {len(data)}\n"
-    header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            # Add header information
+            header = f"# Stock data for {symbol.upper()} from {start_date} to {end_date}\n"
+            header += f"# Total records: {len(data)}\n"
+            header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
 
-    return header + csv_string
+            return header + csv_string
+            
+        except (RequestException, Exception) as e:
+            error_msg = str(e).lower()
+            if "rate" in error_msg or "limit" in error_msg or "429" in error_msg:
+                if attempt == max_retries - 1:
+                    # Try to use local data as fallback
+                    try:
+                        local_data = get_YFin_data(symbol, start_date, end_date)
+                        if local_data and "No local data found" not in local_data:
+                            return f"# Using cached local data due to API rate limits\n\n{local_data}"
+                    except:
+                        pass
+                    
+                    return (
+                        f"# Yahoo Finance API rate limit exceeded for {symbol.upper()}\n"
+                        f"# Please try again later or use alternative data sources\n"
+                        f"# You can also check if local cached data is available\n\n"
+                        f"Error: Rate limit exceeded after {max_retries} attempts"
+                    )
+                continue
+            else:
+                # Non-rate-limit error, don't retry
+                return f"Error retrieving data for {symbol}: {str(e)}"
+    
+    return f"Failed to retrieve data for {symbol} after {max_retries} attempts"
 
 
 def get_YFin_data(
@@ -672,41 +712,62 @@ def get_YFin_data(
     start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
     end_date: Annotated[str, "Start date in yyyy-mm-dd format"],
 ) -> str:
-    # read in data
-    data = pd.read_csv(
-        os.path.join(
+    try:
+        # Try to read local cached data first
+        data_file_path = os.path.join(
             DATA_DIR,
             f"market_data/price_data/{symbol}-YFin-data-2015-01-01-2025-03-25.csv",
         )
-    )
+        
+        if not os.path.exists(data_file_path):
+            return f"No local data found for {symbol}. Please use online data source or ensure data is cached locally."
+        
+        data = pd.read_csv(data_file_path)
 
-    if end_date > "2025-03-25":
-        raise Exception(
-            f"Get_YFin_Data: {end_date} is outside of the data range of 2015-01-01 to 2025-03-25"
-        )
+        if end_date > "2025-03-25":
+            # If requested end date is beyond cached data, try to get online data
+            print(f"Requested date {end_date} is beyond cached data range. Attempting to fetch online data...")
+            try:
+                online_data = get_YFin_data_online(symbol, start_date, end_date)
+                if online_data and "rate limit" not in online_data.lower():
+                    return online_data
+            except Exception as e:
+                print(f"Online data fetch failed: {e}")
+            
+            # Fall back to available cached data if online fails
+            print(f"Falling back to cached data up to 2025-03-25")
+            end_date = min(end_date, "2025-03-25")
 
-    # Extract just the date part for comparison
-    data["DateOnly"] = data["Date"].str[:10]
+        # Extract just the date part for comparison
+        data["DateOnly"] = data["Date"].str[:10]
 
-    # Filter data between the start and end dates (inclusive)
-    filtered_data = data[
-        (data["DateOnly"] >= start_date) & (data["DateOnly"] <= end_date)
-    ]
+        # Filter data between the start and end dates (inclusive)
+        filtered_data = data[
+            (data["DateOnly"] >= start_date) & (data["DateOnly"] <= end_date)
+        ]
 
-    # Drop the temporary column we created
-    filtered_data = filtered_data.drop("DateOnly", axis=1)
+        # Drop the temporary column we created
+        filtered_data = filtered_data.drop("DateOnly", axis=1)
 
-    # remove the index from the dataframe
-    filtered_data = filtered_data.reset_index(drop=True)
+        # remove the index from the dataframe
+        filtered_data = filtered_data.reset_index(drop=True)
 
-    return filtered_data
+        if filtered_data.empty:
+            return f"No data found for {symbol} between {start_date} and {end_date} in local cache."
+
+        return filtered_data
+
+    except FileNotFoundError:
+        return f"Local data file not found for {symbol}. Please use online data source."
+    except Exception as e:
+        return f"Error reading local data for {symbol}: {str(e)}"
 
 
 def get_stock_news_openai(ticker, curr_date):
     client = OpenAI()
 
     response = client.responses.create(
-        model="gpt-4.1-mini",
+        model="deepseek-chat",
         input=[
             {
                 "role": "system",
@@ -802,3 +863,40 @@ def get_fundamentals_openai(ticker, curr_date):
     )
 
     return response.output[1].content[0].text
+
+
+def get_stock_data_smart(
+    symbol: Annotated[str, "ticker symbol of the company"],
+    start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
+    end_date: Annotated[str, "Start date in yyyy-mm-dd format"],
+) -> str:
+    """
+    Smart stock data retrieval function that tries multiple data sources:
+    1. First tries local cached data if available and covers the date range
+    2. Falls back to online data with rate limiting protection
+    3. Provides clear feedback about data source and limitations
+    """
+    
+    # Check if we have local data and it covers our date range
+    try:
+        local_data = get_YFin_data(symbol, start_date, end_date)
+        if (isinstance(local_data, pd.DataFrame) and not local_data.empty) or \
+           (isinstance(local_data, str) and "No data found" not in local_data and "Error" not in local_data):
+            print(f"✓ Using local cached data for {symbol}")
+            return f"# Using local cached data for {symbol}\n\n{local_data}"
+    except Exception as e:
+        print(f"Local data not available: {e}")
+    
+    # Try online data with protection against rate limits
+    print(f"Attempting to fetch online data for {symbol}...")
+    try:
+        online_data = get_YFin_data_online(symbol, start_date, end_date)
+        if online_data and "rate limit" not in online_data.lower() and "Error" not in online_data:
+            print(f"✓ Successfully retrieved online data for {symbol}")
+            return online_data
+        else:
+            print(f"⚠ Online data retrieval had issues: rate limiting or errors")
+            return online_data
+    except Exception as e:
+        print(f"Online data fetch failed: {e}")
+        return f"Unable to retrieve data for {symbol}: {str(e)}"
